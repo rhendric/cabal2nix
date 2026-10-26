@@ -8,6 +8,7 @@ import Distribution.Nixpkgs.Fetch
 import Distribution.Nixpkgs.Haskell.Derivation
 import Distribution.Nixpkgs.Haskell.FromCabal
 import Distribution.Nixpkgs.Haskell.FromCabal.Flags
+import Distribution.Nixpkgs.Haskell.FromCabal.SourceFiles
 
 import Control.Lens
 import Control.Monad
@@ -45,18 +46,23 @@ main = do
   cabal2nix <- findExecutable "cabal2nix" >>= \case
     Nothing -> fail "cannot find 'cabal2nix' in $PATH"
     Just exe -> pure exe
-  testCases <- listDirectoryFilesBySuffix ".cabal" "test/golden-test-cases"
+  testCases <- concat <$> sequence
+    [ listDirectoryFilesBySuffix ".cabal" "test/golden-test-cases"
+    , listDirectories "test/golden-test-cases"
+    ]
   defaultMain $ testGroup "regression-tests"
     [ testGroup "cabal2nix library" (map testLibrary testCases)
     , testGroup "cabal2nix executable" (map (testExecutable cabal2nix) testCases)
     ]
 
 testLibrary :: String -> TestTree
-testLibrary cabalFile = do
-  let nixFile = cabalFile `replaceExtension` "nix"
+testLibrary cabalFileOrDir = do
+  let nixFile = cabalFileOrDir `replaceExtension` "nix"
+      isLocal = not $ "cabal" `isExtensionOf` cabalFileOrDir
+      cabalFile = if isLocal then cabalFileOrDir </> takeFileName cabalFileOrDir `addExtension` "cabal" else cabalFileOrDir
       goldenFile = nixFile `addExtension` "golden"
 
-      cabal2nix :: GenericPackageDescription -> Derivation
+      cabal2nix :: GenericPackageDescription -> IO Derivation
       cabal2nix gpd = fromGenericPackageDescription
                          (const True)
                          (\i -> Just (binding # (i, path # [ident # "pkgs", i])))
@@ -66,14 +72,15 @@ testLibrary cabalFile = do
                          []
                          gpd
                        & src .~ DerivationSource
-                                  { derivKind     = Just (DerivKindUrl DontUnpackArchive )
-                                  , derivUrl      = "mirror://hackage/foo.tar.gz"
+                                  { derivKind     = if isLocal then Left (takeFileName cabalFile, []) else Right (DerivKindUrl DontUnpackArchive)
+                                  , derivUrl      = if isLocal then cabalFileOrDir else "mirror://hackage/foo.tar.gz"
                                   , derivRevision = ""
                                   , derivHash     = "deadbeef"
                                   , derivSubmodule = Nothing
                                   , derivCustomSrc = Nothing
                                   }
                        & extraFunctionArgs %~ Set.union (Set.singleton "inherit lib")
+                       & insertFilesetItems cabalFileOrDir gpd
   goldenVsFileDiff
     nixFile
     (\ref new -> ["diff", "-u", ref, new])
@@ -84,7 +91,7 @@ testLibrary cabalFile = do
 #else
     (readGenericPackageDescription silentCompat cabalFile
 #endif
-     >>= writeFileLn nixFile . prettyShow . cabal2nix)
+     >>= cabal2nix >>= writeFileLn nixFile . prettyShow)
 
 silentCompat :: Verbosity
 #if MIN_VERSION_Cabal(3,18,0)
@@ -140,6 +147,13 @@ listDirectoryFilesBySuffix :: String -> FilePath -> IO [FilePath]
 listDirectoryFilesBySuffix suff dirPath = do
   entries <- listDirectory dirPath
   filterM doesFileExist [ dirPath </> e | e <- entries, takeExtension e == suff ]
+
+-- | Find all *directories* in the given directory.
+
+listDirectories ::  FilePath -> IO [FilePath]
+listDirectories dirPath = do
+  entries <- listDirectory dirPath
+  filterM doesDirectoryExist [ dirPath </> e | e <- entries ]
 
 -- | A variant of 'writeFile' that appends a newline to the end of the buffer
 -- before writing.

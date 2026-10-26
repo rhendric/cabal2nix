@@ -1,13 +1,15 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE LambdaCase #-}
 
 module Distribution.Nixpkgs.Fetch
   ( Source(..)
   , Hash(..)
-  , DerivationSource(..), fromDerivationSource, urlDerivationSource
+  , DerivationSource(..), fromDerivationSource, urlDerivationSource, derivKindLens
+  , DerivFilesetItem(..), DerivFilesetFilter(..)
   , DerivKind(..)
   , derivKindFunction
   , FetchSubmodules(..)
@@ -18,12 +20,15 @@ module Distribution.Nixpkgs.Fetch
 
 import Control.Applicative
 import Control.DeepSeq
+import Control.Lens (makeLensesFor)
 import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Trans.Maybe
 import Data.Aeson
 import qualified Data.ByteString.Lazy.Char8 as BS
 import qualified Data.List as L
+import Data.List.NonEmpty (NonEmpty)
+import qualified Data.List.NonEmpty as NE
 import Data.Maybe
 import Distribution.Nixpkgs.Color (colorStderrLn, commandColor, warningColor)
 import GHC.Generics ( Generic )
@@ -60,7 +65,10 @@ hashToList _           = []
 -- | A source for a derivation. It always needs a hash and also has a protocol attached to it (url, git, svn, ...).
 -- A @DerivationSource@ also always has it's revision fully resolved (not relative revisions like @master@, @HEAD@, etc).
 data DerivationSource = DerivationSource
-  { derivKind     :: Maybe DerivKind -- ^ The kind of the source. If Nothing, it is a local derivation.
+  { derivKind     :: Either (FilePath, [DerivFilesetItem]) DerivKind
+    -- ^ The kind of the source. If Left, it is a local derivation. The first
+    -- element of the left pair is the relative path to the .cabal file or
+    -- package.yaml. An empty list of fileset items means not to use a fileset.
   , derivUrl      :: String -- ^ URL to fetch from.
   , derivRevision :: String -- ^ Revision to use. Leave empty if the fetcher doesn't support revisions.
   , derivHash     :: String -- ^ The hash of the source.
@@ -88,8 +96,19 @@ instance PP.Pretty DerivationSource where
         let isHackagePackage = "mirror://hackage/" `L.isPrefixOf` derivUrl
         in if isHackagePackage then if derivHash /= "" then attr "sha256" $ string derivHash else mempty
            else case derivKind of
-              Nothing ->  attr "src" $ text derivUrl
-              Just derivKind' -> vcat
+              Left (_, []) -> attr "src" $ text derivUrl
+              Left (_, [DerivFilesetSingleItem item]) | item == derivUrl -> attr "src" $ text derivUrl
+              Left (_, items) -> vcat
+                     [ text "src" <+> equals <+> text "lib.fileset.toSource" <+> lbrace
+                     , nest 2 $ vcat
+                        [ attr "root" (text derivUrl)
+                        , text "fileset" <+> equals <+> text "lib.fileset.unions" <+> lbrack
+                        , nest 2 $ vcat $ map pPrint items
+                        , rbrack PP.<> semi
+                        ]
+                     , rbrace PP.<> semi
+                     ]
+              Right derivKind' -> vcat
                      [ text "src" <+> equals <+> text (derivKindFunction derivKind') <+> lbrace
                      , nest 2 $ vcat
                        [ attr "url" $ string derivUrl
@@ -104,7 +123,7 @@ instance PP.Pretty DerivationSource where
 urlDerivationSource :: String -> String -> DerivationSource
 urlDerivationSource url hash =
   DerivationSource {
-    derivKind = Just (DerivKindUrl DontUnpackArchive),
+    derivKind = Right (DerivKindUrl DontUnpackArchive),
     derivUrl = url,
     derivRevision = "",
     derivHash = hash,
@@ -155,8 +174,7 @@ fetch optSubModules f = runMaybeT . fetchers where
     existsFile <- liftIO $ doesFileExist path
     existsDir  <- liftIO $ doesDirectoryExist path
     guard $ existsDir || existsFile
-    let path' | '/' `elem` path = path
-              | otherwise       = "./" ++ path
+    let path' = toNixPath path
     process (localDerivationSource path', path') <|> localArchive path'
 
   localArchive :: FilePath -> MaybeT IO (DerivationSource, a)
@@ -179,7 +197,7 @@ fetch optSubModules f = runMaybeT . fetchers where
 
   localDerivationSource p =
     DerivationSource {
-      derivKind = Nothing,
+      derivKind = Left ("", []),
       derivUrl = p,
       derivRevision = "",
       derivHash = "",
@@ -209,6 +227,34 @@ data UnpackArchive = UnpackArchive | DontUnpackArchive
   deriving (Show, Generic)
 
 instance NFData UnpackArchive
+
+
+data DerivFilesetItem
+  = DerivFilesetSingleItem String
+  | DerivFilesetFilterItem String (NonEmpty DerivFilesetFilter)
+  deriving (Show, Generic)
+
+instance NFData DerivFilesetItem
+
+instance PP.Pretty DerivFilesetItem where
+  pPrint = \case
+    DerivFilesetSingleItem path -> text $ toNixPath path
+    DerivFilesetFilterItem prefix filters ->
+      parens $ hsep
+        [ text "lib.fileset.fileFilter"
+        , parens $ hsep $ "file:" : L.intersperse (text "||") (map pPrint $ NE.toList filters)
+        , text $ toNixPath prefix
+        ]
+
+data DerivFilesetFilter = DerivFilesetFilterByName String | DerivFilesetFilterByExtension String
+  deriving (Show, Generic)
+
+instance NFData DerivFilesetFilter
+
+instance PP.Pretty DerivFilesetFilter where
+  pPrint = \case
+    DerivFilesetFilterByName name -> text "file.name ==" <+> string name
+    DerivFilesetFilterByExtension ext -> text "file.hasExt" <+> string ext
 
 
 -- | The nixpkgs function to use for fetching this kind of derivation
@@ -267,7 +313,7 @@ fetchWith (supportsRev, kind) source = do
             buf'   = BS.unlines (reverse ls)
         case ls of
           [] -> return Nothing
-          [hash] -> return (Just (DerivationSource { derivKind = Just kind
+          [hash] -> return (Just (DerivationSource { derivKind = Right kind
                                               , derivUrl = sourceUrl source
                                               , derivRevision = ""
                                               , derivHash = BS.unpack hash
@@ -277,7 +323,7 @@ fetchWith (supportsRev, kind) source = do
                             , BS.unpack l))
           _ -> case eitherDecode buf' of
                  Left err -> error ("invalid JSON: " ++ err ++ " in " ++ show buf')
-                 Right ds -> return (Just (ds { derivKind = Just kind, derivCustomSrc = Nothing }, BS.unpack l))
+                 Right ds -> return (Just (ds { derivKind = Right kind, derivCustomSrc = Nothing }, BS.unpack l))
 
 
 stripPrefix :: Eq a => [a] -> [a] -> [a]
@@ -286,3 +332,13 @@ stripPrefix prefix as
   | otherwise = as
  where
   (prefix', stripped) = splitAt (length prefix) as
+
+
+toNixPath :: String -> String
+toNixPath path
+  | '/' `elem` path = path
+  | otherwise       = "./" ++ path
+
+
+-- DerivationSource isn't lensy (yet?), but it's nice to have a lens for this one field.
+makeLensesFor [("derivKind", "derivKindLens")] ''DerivationSource
